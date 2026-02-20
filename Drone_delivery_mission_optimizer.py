@@ -148,6 +148,179 @@ def get_instantaneous_power(vx_ground, vz_climb, h, thrust_input, v_wind_overrid
     return (drag_power_numerator / efficiency_term) + ((weight + (downforce / gravity)) / efficiency_term) + (weight * gravity * vz_climb)
 
 # ------------------------------------------------------------------------------------------------------------
+# RIGID BODY DYNAMICS & L1 CONTROLLER (Simulating Real Drone)
+# ------------------------------------------------------------------------------------------------------------
+
+class RigidBodyDrone:
+    def __init__(self, m=2.0, Iyy=0.02):
+        self.m = m
+        self.Iyy = Iyy  # Simplification for 2D pitch-plane dynamics
+        self.g = 9.80665
+        
+        # State: [x, z, vx, vz, theta, q]
+        # x, z: position
+        # vx, vz: velocity
+        # theta: pitch angle (positive is pitch up/backward, negative is pitch down/forward)
+        # q: pitch rate
+        self.state = np.zeros(6)
+        
+    def dynamics(self, state, thrust, tau, v_wind=0):
+        x, z, vx, vz, theta, q = state
+        
+        # Relative velocity (air velocity)
+        vx_air = vx + v_wind
+        v_total_air = np.sqrt(vx_air**2 + vz**2 + 1e-6)
+        
+        # Simplified drag model (matching optimizer's intent roughly)
+        cd = 0.2 if abs(vz) > abs(vx_air) else 0.05
+        rho = 1.225 # Simplified for simulation step
+        drag_force = 0.5 * rho * v_total_air**2 * cd * 0.1 # 0.1 is effective area approx
+        
+        drag_x = -drag_force * (vx_air / v_total_air)
+        drag_z = -drag_force * (vz / v_total_air)
+        
+        # Equations of motion
+        # Note: In our coordinate system, theta=0 is hover. 
+        # Negative theta tilts drone forward -> positive vx acceleration.
+        ax = (thrust / self.m) * np.sin(-theta) + (drag_x / self.m)
+        az = (thrust / self.m) * np.cos(theta) - self.g + (drag_z / self.m)
+        alpha = tau / self.Iyy
+        
+        return np.array([vx, vz, ax, az, q, alpha])
+
+    def step(self, thrust, tau, dt, v_wind=0):
+        # RK4 integration
+        k1 = self.dynamics(self.state, thrust, tau, v_wind)
+        k2 = self.dynamics(self.state + 0.5 * dt * k1, thrust, tau, v_wind)
+        k3 = self.dynamics(self.state + 0.5 * dt * k2, thrust, tau, v_wind)
+        k4 = self.dynamics(self.state + dt * k3, thrust, tau, v_wind)
+        self.state += (dt/6.0) * (k1 + 2*k2 + 2*k3 + k4)
+
+class CascadedPIDController:
+    def __init__(self):
+        # Position Loop Gains
+        self.kp_pos_x = 1.2
+        self.kp_pos_z = 2.0
+        
+        # Velocity Loop Gains
+        self.kp_vel_x = 1.0
+        self.ki_vel_x = 0
+        self.kd_vel_x = 3
+        self.kp_vel_z = 2.0
+        self.ki_vel_z = 0
+        self.kd_vel_z = 5
+        
+        # Attitude Loop Gains (Theta)
+        self.kp_theta = 30.0
+        self.kd_theta = 8.0
+        
+        # Integrator states for I-terms
+        self.vel_x_int = 0.0
+        self.vel_z_int = 0.0
+        
+    def update(self, drone_state, target_pos, target_vel, dt):
+        """
+        Cascaded PID Control Loop:
+        1. Position Error -> Velocity Command
+        2. Velocity Error -> Acceleration Command
+        3. Acceleration -> Target Attitude & Thrust
+        4. Attitude Error -> Torque (tau)
+        """
+        x, z, vx, vz, theta, q = drone_state
+        tx, tz = target_pos
+        tvx, tvz = target_vel
+        
+        # 1. Outer Loop: Position to Velocity
+        # We add the feed-forward target velocity from the optimizer
+        vx_cmd = self.kp_pos_x * (tx - x) + tvx
+        vz_cmd = self.kp_pos_z * (tz - z) + tvz
+        
+        # Physical constraints on commanded velocity
+        vx_cmd = np.clip(vx_cmd, -30, 30)
+        vz_cmd = np.clip(vz_cmd, -8, 8)
+        
+        # 2. Middle Loop: Velocity to Acceleration
+        err_vx = vx_cmd - vx
+        err_vz = vz_cmd - vz
+        
+        self.vel_x_int += err_vx * dt
+        self.vel_z_int += err_vz * dt
+        
+        # Anti-windup for integrators
+        self.vel_x_int = np.clip(self.vel_x_int, -10, 10)
+        self.vel_z_int = np.clip(self.vel_z_int, -5, 5)
+        
+        ax_cmd = self.kp_vel_x * err_vx + self.ki_vel_x * self.vel_x_int + (self.kd_vel_x * (err_vx - self.vel_x_int))
+        az_cmd = self.kp_vel_z * err_vz + self.ki_vel_z * self.vel_z_int + (self.kd_vel_z * (err_vz - self.vel_z_int))
+        
+        # 3. Conversion: Acceleration to Thrust and Pitch
+        # g compensation is critical here
+        acc_total_z = az_cmd + 9.80665
+        acc_total_x = ax_cmd
+        
+        # Thrust required to achieve total acceleration vector (m=2.0)
+        thrust_cmd = 2.0 * np.sqrt(acc_total_x**2 + acc_total_z**2)
+        
+        # Target theta to align thrust vector with ax_cmd
+        # Negative theta = pitch forward = positive x acceleration
+        theta_cmd = -np.arctan2(acc_total_x, acc_total_z)
+        
+        # 4. Inner Loop: Attitude to Torque
+        # Simple PD on angle and rate
+        tau = self.kp_theta * (theta_cmd - theta) - self.kd_theta * q
+        
+        # Physical saturation
+        thrust_cmd = np.clip(thrust_cmd, 5, 50) # 0.25g to 2.5g
+        tau = np.clip(tau, -5.0, 5.0)
+        
+        return thrust_cmd, tau, theta_cmd
+
+def run_real_drone_simulation(opt_result):
+    if not opt_result['success']: return None
+    
+    dt_sim = 0.01 # Faster timestep for PID stability
+    t_end = opt_result['Total_Time']
+    steps = int(t_end / dt_sim)
+    
+    drone = RigidBodyDrone(m=weight)
+    controller = CascadedPIDController()
+    
+    # Interpolate optimized trajectory
+    t_opt = np.linspace(0, t_end, N+1)
+    x_ref = np.interp(np.linspace(0, t_end, steps), t_opt, opt_result['X'])
+    z_ref = np.interp(np.linspace(0, t_end, steps), t_opt, opt_result['H'])
+    vx_ref = np.interp(np.linspace(0, t_end, steps), t_opt[1:], opt_result['Vx'])
+    vz_ref = np.interp(np.linspace(0, t_end, steps), t_opt[1:], opt_result['Vz'])
+    
+    sim_data = {'x': [], 'z': [], 'vx': [], 'vz': [], 'theta': [], 't': [], 'theta_cmd': []}
+    
+    # Init state
+    drone.state[0] = opt_result['X'][0]
+    drone.state[1] = opt_result['H'][0]
+    
+    for i in range(steps):
+        t = i * dt_sim
+        tar_pos = (x_ref[i], z_ref[i])
+        tar_vel = (vx_ref[i], vz_ref[i])
+        
+        v_wind = float(get_wind_speed(drone.state[1]))
+        
+        thrust, tau, th_cmd = controller.update(drone.state, tar_pos, tar_vel, dt_sim)
+        drone.step(thrust, tau, dt_sim, v_wind)
+        
+        # Sub-sample data to keep plot manageable
+        if i % 5 == 0:
+            sim_data['x'].append(drone.state[0])
+            sim_data['z'].append(drone.state[1])
+            sim_data['vx'].append(drone.state[2])
+            sim_data['vz'].append(drone.state[3])
+            sim_data['theta'].append(drone.state[4])
+            sim_data['theta_cmd'].append(th_cmd)
+            sim_data['t'].append(t)
+        
+    return sim_data
+
+# ------------------------------------------------------------------------------------------------------------
 # DELIVERY MISSION OPTIMIZER (7-Phase Mission)
 # ------------------------------------------------------------------------------------------------------------
 
@@ -509,6 +682,13 @@ def plot_mission_comparison(baseline, delivery_results):
     ax1.set_xlabel('Distance (km)', fontsize=13)
     ax1.set_ylabel('Altitude (m)', fontsize=13)
     ax1.set_title('Mission Trajectory: Altitude vs Distance', fontsize=15, fontweight='bold')
+    
+    # NEW: Plot real drone traces
+    for i, res in enumerate(successful_deliveries):
+        if 'sim' in res and res['sim'] is not None:
+            ax1.plot(np.array(res['sim']['x'])/1000, res['sim']['z'], '--', 
+                    color=colors[i], alpha=0.8, linewidth=1.5, label=f"Real Drone Trace ({res['loiter_duration']}s)")
+            
     ax1.grid(True, alpha=0.3)
     ax1.legend(fontsize=10, loc='best')
     fig1.tight_layout()
@@ -523,7 +703,10 @@ def plot_mission_comparison(baseline, delivery_results):
     for i, res in enumerate(successful_deliveries):
         t = np.linspace(0, res['Total_Time'], N+1)
         ax2.plot(t/60, res['H'], linewidth=2.5, color=colors[i],
-                label=f"Loiter: {res['loiter_duration']}s")
+                label=f"Optimized: {res['loiter_duration']}s")
+        if 'sim' in res and res['sim'] is not None:
+            ax2.plot(np.array(res['sim']['t'])/60, res['sim']['z'], '--', 
+                    color=colors[i], alpha=0.6, label=f"Real: {res['loiter_duration']}s")
     
     # Add annotations for wind-aware strategy
     mid_time = successful_deliveries[0]['Total_Time'] / 120  # midpoint in minutes
@@ -548,23 +731,31 @@ def plot_mission_comparison(baseline, delivery_results):
     # Horizontal velocity
     for i, res in enumerate(successful_deliveries):
         t = np.linspace(0, res['Total_Time'], N)
-        ax3a.plot(t/60, res['Vx'], linewidth=2, color=colors[i], 
-                label=f"Loiter: {res['loiter_duration']}s")
+        ax3a.plot(t/60, res['Vx'], linewidth=2.5, color=colors[i], 
+                label=f"Opt: {res['loiter_duration']}s")
+        if 'sim' in res and res['sim'] is not None:
+            ax3a.plot(np.array(res['sim']['t'])/60, res['sim']['vx'], '--', 
+                    color=colors[i], alpha=0.7, label=f"Real: {res['loiter_duration']}s")
+            
     ax3a.axhline(y=0, color='k', linestyle='--', alpha=0.3)
     ax3a.set_xlabel('Time (minutes)', fontsize=12)
     ax3a.set_ylabel('Horizontal Velocity (m/s)', fontsize=12)
-    ax3a.set_title('Horizontal Velocity (+ = Outbound, - = Return)', fontsize=13, fontweight='bold')
+    ax3a.set_title('Horizontal Velocity Comparison', fontsize=13, fontweight='bold')
     ax3a.grid(True, alpha=0.3)
-    ax3a.legend(fontsize=9)
+    ax3a.legend(fontsize=8, loc='best')
     
     # Vertical velocity
     for i, res in enumerate(successful_deliveries):
         t = np.linspace(0, res['Total_Time'], N)
-        ax3b.plot(t/60, res['Vz'], linewidth=2, color=colors[i])
+        ax3b.plot(t/60, res['Vz'], linewidth=2.5, color=colors[i], label=f"Opt")
+        if 'sim' in res and res['sim'] is not None:
+            ax3b.plot(np.array(res['sim']['t'])/60, res['sim']['vz'], '--', 
+                    color=colors[i], alpha=0.7, label=f"Real")
+            
     ax3b.axhline(y=0, color='k', linestyle='--', alpha=0.3)
     ax3b.set_xlabel('Time (minutes)', fontsize=12)
     ax3b.set_ylabel('Vertical Velocity (m/s)', fontsize=12)
-    ax3b.set_title('Climb/Descent Profile', fontsize=13, fontweight='bold')
+    ax3b.set_title('Vertical Velocity Comparison', fontsize=13, fontweight='bold')
     ax3b.grid(True, alpha=0.3)
     
     fig3.suptitle('Velocity Profiles', fontsize=15, fontweight='bold')
@@ -651,6 +842,9 @@ if __name__ == "__main__":
     
     for loiter_time in loiter_durations:
         result = solve_delivery_mission(loiter_duration=loiter_time, verbose=True)
+        if result['success']:
+            print(f"Running real drone simulation for loiter {loiter_time}s...")
+            result['sim'] = run_real_drone_simulation(result)
         delivery_results.append(result)
     
     # Summary
